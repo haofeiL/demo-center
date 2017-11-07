@@ -11,6 +11,8 @@
     <modules>
         <module>demo-logback-appender</module>
         <module>demo-crawler</module>
+        <module>demo-rabbitmq</module>
+        <module>demo-scala</module>
     </modules>
 
     <properties>
@@ -19,6 +21,7 @@
         <logback-classic.version>1.1.2</logback-classic.version>
         <commons-lang3.version>3.5</commons-lang3.version>
         <selenium-java.version>3.4.0</selenium-java.version>
+        <rabbitmq-version>4.2.0</rabbitmq-version>
     </properties>
 
     <dependencyManagement>
@@ -345,6 +348,11 @@
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-starter-ws</artifactId>
                 <version>${spring-boot.version}</version>
+            </dependency>
+            <dependency>
+                <groupId>com.rabbitmq</groupId>
+                <artifactId>amqp-client</artifactId>
+                <version>${rabbitmq-version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

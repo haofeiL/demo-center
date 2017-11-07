@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xmlns:rabbit="http://www.springframework.org/schema/rabbit"
+       xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd
+       http://www.springframework.org/schema/rabbit  http://www.springframework.org/schema/rabbit/spring-rabbit-1.0.xsd">
+
+
+    <rabbit:direct-exchange name="1" auto-delete="false" durable="false" >
+        <rabbit:bindings >
+            <rabbit:binding key=""></rabbit:binding>
+        </rabbit:bindings>
+    </rabbit:direct-exchange>
+
+    <rabbit:topic-exchange name="456">
+        <rabbit:bindings>
+            <rabbit:binding queue="" pattern=""  ></rabbit:binding>
+            <rabbit:binding queue="" pattern=""></rabbit:binding>
+        </rabbit:bindings>
+    </rabbit:topic-exchange>
+
+    <rabbit:fanout-exchange name="789">
+        <rabbit:bindings>
+            <rabbit:binding queue=""  ></rabbit:binding>
+        </rabbit:bindings>
+    </rabbit:fanout-exchange>
+
+
+    <rabbit:listener-container   >
+        <rabbit:listener ref=""  ></rabbit:listener>
+    </rabbit:listener-container>
+
+</beans>
