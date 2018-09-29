@@ -1,0 +1,629 @@
+package com.mobanker.crawler.ebank.worker.service.impl;
+
+import com.alibaba.fastjson.JSON;
+import com.alibaba.fastjson.JSONArray;
+import com.alibaba.fastjson.JSONObject;
+import com.alibaba.fastjson.JSONPath;
+import com.mobanker.crawler.commons.log.LogBean;
+import com.mobanker.crawler.ebank.common.constant.RetCode;
+import com.mobanker.crawler.ebank.common.model.*;
+import com.mobanker.crawler.ebank.common.util.ChaojiyingUtil;
+import com.mobanker.crawler.ebank.common.util.JSoupUtils;
+import com.mobanker.crawler.ebank.common.util.http.HttpClientDownloader;
+import com.mobanker.crawler.ebank.common.util.http.request.HttpGetRequest;
+import com.mobanker.crawler.ebank.common.util.http.request.HttpPostRequest;
+import com.mobanker.crawler.ebank.common.util.http.response.HttpResponse;
+import com.mobanker.crawler.ebank.worker.service.AbstractCrawlerService;
+import com.mobanker.crawler.ebank.worker.service.Provider;
+import com.mobanker.crawler.ebank.worker.utils.CrawlerHttpUtils;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.collections.map.HashedMap;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.http.client.CookieStore;
+import org.jsoup.Jsoup;
+import org.jsoup.nodes.Document;
+import org.openqa.selenium.WebDriver;
+import org.springframework.stereotype.Service;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * Created by xuejingwen on 2018/9/11.
+ */
+@Slf4j
+@Service("H5CMBCCCrawlerServiceImpl")
+@Provider(value = "CMBCC", id = "010008c")
+public class H5CMBCCCrawlerServiceImpl extends AbstractCrawlerService {
+
+    private final static String CLIENTNOKEY = "clientNo";
+
+    private final static String IMGURLKEY = "imgUrl";
+
+    @Override
+    public WebDriver initWebDriver(String taskId) throws Exception {
+        return null;
+    }
+
+    @Override
+    public RetCode login(WebDriver driver, Task task, Map<String, Object> extendMap) throws Exception {
+        RetCode retCode = RetCode.FAILURE;
+        HttpClientDownloader httpClientDownloader = null;
+        String exception = null;
+        try {
+            if(StringUtils.isNotBlank(task.getVerifyCode())) {
+                // 包含短信验证码，二次登录认证
+                httpClientDownloader = new HttpClientDownloader();
+                // TODO: 2018/9/11 redis获取公共参数extendMap
+                Map<String, Object> cache = redisService.getCommParams(task.getTaskID());
+                if(cache != null) {
+                    extendMap.putAll(cache);
+                }
+                if(extendMap == null || extendMap.isEmpty() || StringUtils.isBlank(String.valueOf(extendMap.get(COOKIEKEY)))) {
+                    retCode = RetCode.INVALID;
+                }
+                String cookieString = String.valueOf(extendMap.get(COOKIEKEY));
+                httpClientDownloader.setCookieStore(generateCookieStore(cookieString));
+                retCode = secondLogin(httpClientDownloader, task, extendMap);
+            } else {
+                // 初次登录认证
+                // 1.获取clientNo
+                // 2.识别图片验证码
+                // 3.触发初次登录请求
+                // 4.根据返回值进行业务逻辑（直接返回或者发送短信验证码）
+                httpClientDownloader = new HttpClientDownloader();
+                if(getClientNo(httpClientDownloader, task, extendMap)) {
+                    //成功过去clientNo,进行图片验证码校验
+                    int count = 0;
+                    while(count < 3) {
+                        String imgValue = validateImageValue(httpClientDownloader, task, extendMap);
+                        retCode = firstLogin(httpClientDownloader, task, extendMap, imgValue);
+                        if(retCode != RetCode.IMG_VALIDATE_ERROR) {
+                            // 图片验证码识别错误，继续识别
+                            count++;
+                            if(count >= 3) {
+                                // 识别图片验证码错误次数超限，返回失败
+                                retCode = RetCode.FAILURE;
+                                return retCode;
+                            }
+                        } else {
+                            break;
+                        }
+                    }
+                } else {
+                    retCode = RetCode.FAILURE.setMsg("网络开小差，请稍后重试");
+                }
+            }
+        } catch (Exception e) {
+            log.warn(">>>>>>>>>>招商信用卡H5渠道登录总入口(account>>>>>>>>>>{}, phone>>>>>>>>>>{}, taskId>>>>>>>>>>{})异常>>>>>>>>>>{}",
+                    task.getLoginName(), task.getPhoneNum(), task.getTaskID(), e);
+            retCode = RetCode.FAILURE.setMsg("网络开小差，请稍后重试");
+            exception = e.getMessage();
+        } finally {
+            if(httpClientDownloader != null) {
+                httpClientDownloader.shutdown();
+            }
+            log.info(new LogBean().setAccount(task.getLoginName())
+                    .setUserId(task.getPhoneNum())
+                    .setToken(task.getToken())
+                    .setMethod("H5CMBCCCrawlerServiceImpl.getClientNo")
+                    .setStatus(retCode.code() + "")
+                    .setMessage(retCode.msg())
+                    .setProvince(task.getWebsite())
+                    .setSellId(SELLID)
+                    .setException(exception)
+                    .log2JsonStr());
+        }
+        return retCode;
+    }
+
+    @Override
+    public List<Account> crawlerAccount(WebDriver driver, Task task, Map<String, Object> extendMap) {
+        HttpClientDownloader httpClientDownloader = null;
+        List<Account> accountList = null;
+        try {
+            httpClientDownloader.setCookieStore(generateCookieStore(String.valueOf(extendMap.get(COOKIEKEY))));
+            HttpPostRequest httpPostRequest = new HttpPostRequest();
+            httpPostRequest.setUrl("https://html.m.cmbchina.com/MobileHtml/CreditCard/M_CustomerService/cm_QueryCustomInfo.aspx");
+            httpPostRequest.setCharset("utf-8");
+
+            Map<String,String> headers = new HashedMap();
+            headers.put("Host", "html.m.cmbchina.com");
+            headers.put("Origin", "https://html.m.cmbchina.com");
+            headers.put("User-Agent", "Mozilla/5.0 (Linux; Android 5.1; zh-cn; HUAWEI TAG-AL00 Build/HUAWEITAG-AL00) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/39.0.0.0 Mobile Safari/537.36");
+            headers.put("Referer", "https://html.m.cmbchina.com/MobileHtml/creditcard/m_customerservice/cm_querycustominfo.aspx");
+            httpPostRequest.setHeaders(headers);
+            Map<String, Object> fields = new HashedMap(3);
+            fields.put("$RequestMode$", "1");
+            fields.put("ClientNo", String.valueOf(extendMap.get(CLIENTNOKEY)));
+            fields.put("Command", "CMD_QUERYLIST");
+            HttpResponse httpResponse = httpClientDownloader.request(httpPostRequest, false);
+            if(httpResponse != null && StringUtils.isNotBlank(httpResponse.getContent())) {
+                JSONObject json = JSON.parseObject(httpResponse.getContent());
+                String errorCode = String.valueOf(JSONPath.eval(json, "$.$SysResult$.$SysCode$"));
+                if("500".equalsIgnoreCase(errorCode)) {
+                    // 请求账户信息成功
+                    JSONArray jsonArray = (JSONArray) JSONPath.eval(json, "$.$SysResult$.$Content$.ListData");
+                    if(jsonArray != null && !jsonArray.isEmpty()) {
+                        accountList = new ArrayList<>();
+                        for(int i=0, size=jsonArray.size(); i<size; i++) {
+                            JSONObject obj = jsonArray.getJSONObject(i);
+                            Account account = new Account();
+                            account.setStatus(obj.getString("OpenFlag"));
+                            account.setCard_name(obj.getString("AffiCode"));
+                            account.setCard(obj.getString("CardNoDisp"));
+                            account.setHolder(obj.getString("Name"));
+                            accountList.add(account);
+                        }
+                    }
+                }
+            }
+        } catch (Exception e) {
+            log.warn(">>>>>>>>>>");
+        } finally {
+
+        }
+        return accountList;
+    }
+
+    @Override
+    public List<Bill> crawlerBill(WebDriver driver, Task task, Map<String, Object> extendMap) {
+        return null;
+    }
+
+    @Override
+    public List<Flow> crawlerFlow(WebDriver driver, Task task, Map<String, Object> extendMap) {
+        return null;
+    }
+
+    @Override
+    public List<Limit> crawlerLimit(WebDriver driver, Task task, Map<String, Object> extendMap) {
+        return super.crawlerLimit(driver, task, extendMap);
+    }
+
+    @Override
+    public boolean checkLoginSuccess(WebDriver driver, Task task, Map<String, Object> extendMap) {
+
+        return false;
+    }
+
+    /**
+     * 招商信用爬虫总入口
+     * @param task
+     * @param isAsync
+     * @return
+     */
+    @Override
+    public RetCode crawler(Task task, boolean isAsync) {
+        RetCode retCode = RetCode.FAILURE;
+        Map<String, Object> extendMap = new HashedMap();
+        try {
+            retCode = login(null, task, extendMap);
+            if(retCode == RetCode.SUCCESS == checkLoginSuccess(null, task, extendMap)) {
+                //登录成功
+                if(isAsync) {
+                    //同步采集数据
+                    crawlerInfo(null, task, extendMap);
+                } else {
+                    //异步采集数据
+                    crawlerInfoSync(null, task, extendMap);
+                }
+            }
+        } catch (Exception e) {
+            log.error(">>>>>>>>>招商银行信用卡H5渠道采集数据总入口(account>>>>>>>>>>{}, phone>>>>>>>>>>{}, token>>>>>>>>>>{})异常",
+                    task.getLoginName(), task.getPhoneNum(), task.getTaskID());
+            retCode = RetCode.FAILURE;
+        } finally {
+            taskStateChange(task, retCode, true);
+        }
+        return retCode;
+    }
+
+    /**
+     * 获取clientNo
+     * @param httpClientDownloader
+     * @param task
+     * @param extendMap
+     */
+    private boolean getClientNo(HttpClientDownloader httpClientDownloader, Task task, Map<String, Object> extendMap) {
+        boolean status = false;
+        String exception = null;
+        try {
+            HttpGetRequest httpGetRequest = new HttpGetRequest();
+            Map<String, String> headers = new HashedMap();
+            headers.put("Host", "html.m.cmbchina.com");
+            headers.put("x-wap-profile", "http://wap1.huawei.com/uaprof/HUAWEI_TANGO_UAProfile.xml");
+            headers.put("User-Agent", "Mozilla/5.0 (Linux; Android 5.1; zh-cn; HUAWEI TAG-AL00 Build/HUAWEITAG-AL00) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/39.0.0.0 Mobile Safari/537.36");
+            headers.put("Referer", "https://html.m.cmbchina.com/MobileHtml/Login/Logout.aspx");
+            headers.put("X-Requested-With", "com.android.browser");
+            httpGetRequest.setUrl("https://html.m.cmbchina.com/MobileHtml/Login/LoginC.aspx");
+            httpGetRequest.setCharset("utf-8");
+            HttpResponse httpResponse = httpClientDownloader.request(httpGetRequest, false);
+            String response = httpResponse.getContent();
+            Document document = Jsoup.parse(response);
+            String imgUrl = JSoupUtils.findAttributeValueByElement(JSoupUtils.findElementByAttribute(document, "type", "image", true), "src");
+            String clientNo = imgUrl.substring(imgUrl.indexOf("ClientNo=") + "ClientNo=".length());
+            if(StringUtils.isNotBlank(clientNo)) {
+                status = true;
+                extendMap.put(COOKIEKEY, clientNo);
+                extendMap.put(IMGURLKEY, imgUrl);
+            }
+        } catch (Exception e) {
+            log.warn(">>>>>>>>>>招商信用卡H5渠道获取clientNo(account>>>>>>>>>>{}, phone>>>>>>>>>>{}, taskId>>>>>>>>>>{})异常>>>>>>>>>>{}",
+                    task.getLoginName(), task.getPhoneNum(), task.getTaskID(), e);
+            status = false;
+            exception = e.getMessage();
+        } finally {
+            log.info(new LogBean().setAccount(task.getLoginName())
+                    .setUserId(task.getPhoneNum())
+                    .setToken(task.getToken())
+                    .setMethod("H5CMBCCCrawlerServiceImpl.getClientNo")
+                    .setStatus(status ? RetCode.SUCCESS.code() + "" : RetCode.FAILURE.code() + "")
+                    .setProvince(task.getWebsite())
+                    .setSellId(SELLID)
+                    .setException(exception)
+                    .log2JsonStr());
+        }
+        return status;
+    }
+
+    /**
+     * 下载图片验证码&识别
+     * @param httpClientDownloader
+     * @param task
+     * @param extendMap
+     * @return
+     */
+    private String validateImageValue(HttpClientDownloader httpClientDownloader, Task task, Map<String, Object> extendMap) {
+        String imgValue = null;
+        String exception = null;
+        try {
+            String imgUrl = String.valueOf(extendMap.get(IMGURLKEY));
+            //下载图片验证码
+            Map<String, String> imgHeaders = new HashedMap();
+            imgHeaders.put("Host", "html.m.cmbchina.com");
+            imgHeaders.put("x-wap-profile", "http://wap1.huawei.com/uaprof/HUAWEI_TANGO_UAProfile.xml");
+            imgHeaders.put("User-Agent", "Mozilla/5.0 (Linux; Android 5.1; zh-cn; HUAWEI TAG-AL00 Build/HUAWEITAG-AL00) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/39.0.0.0 Mobile Safari/537.36");
+            imgHeaders.put("X-Requested-With", "com.android.browser");
+            Map<String,String> retMap = CrawlerHttpUtils.putChaptaToLocal(pathContext.getImage_path(), imgUrl, task.getTaskID(), imgHeaders);
+            imgValue = ChaojiyingUtil.PostPic("1902", retMap.get(CrawlerHttpUtils.IMGPAHTKEY));
+        } catch (Exception e) {
+            log.warn(">>>>>>>>>>招商信用卡H5渠道下载&识别图片验证码(account>>>>>>>>>>{}, phone>>>>>>>>>>{}, taskId>>>>>>>>>>{})异常>>>>>>>>>>{}",
+                    task.getLoginName(), task.getPhoneNum(), task.getTaskID(), e);
+            exception = e.getMessage();
+        } finally {
+            log.info(new LogBean().setAccount(task.getLoginName())
+                    .setUserId(task.getPhoneNum())
+                    .setToken(task.getToken())
+                    .setMethod("H5CMBCCCrawlerServiceImpl.validateImageValue")
+                    .setStatus(StringUtils.isNotBlank(imgValue) ? RetCode.SUCCESS.code() + "" : RetCode.FAILURE.code() + "")
+                    .setProvince(task.getWebsite())
+                    .setSellId(SELLID)
+                    .setException(exception)
+                    .log2JsonStr());
+        }
+        return imgValue;
+    }
+
+    /**
+     * 初次登录请求，根据返回值确定登录流程
+     * @param httpClientDownloader
+     * @param task
+     * @param extendMap
+     * @param imgValue
+     * @return
+     */
+    private RetCode firstLogin(HttpClientDownloader httpClientDownloader, Task task, Map<String, Object> extendMap, String imgValue) {
+        RetCode retCode = RetCode.FAILURE;
+        String exception = null;
+        try {
+            String clientNo = String.valueOf(extendMap.get(CLIENTNOKEY));
+            HttpPostRequest httpPostRequest = new HttpPostRequest();
+            httpPostRequest.setUrl("https://html.m.cmbchina.com/MobileHtml/Login/LoginC.aspx");
+            httpPostRequest.setCharset("utf-8");
+            Map<String,String> headers = new HashedMap(7);
+            headers.put("Host", "html.m.cmbchina.com");
+            headers.put("Origin", "https://html.m.cmbchina.com");
+            headers.put("x-wap-profile", "http://wap1.huawei.com/uaprof/HUAWEI_TANGO_UAProfile.xml");
+            headers.put("User-Agent", "Mozilla/5.0 (Linux; Android 5.1; zh-cn; HUAWEI TAG-AL00 Build/HUAWEITAG-AL00) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/39.0.0.0 Mobile Safari/537.36");
+            headers.put("Content-Type", "application/x-www-form-urlencoded");
+            headers.put("Referer", "https://html.m.cmbchina.com/MobileHtml/Login/LoginC.aspx");
+            headers.put("X-Requested-With", "com.android.browser");
+            httpPostRequest.setHeaders(headers);
+            Map<String, Object> fields = new HashedMap();
+            httpPostRequest.setFields(fields);
+            fields.put("ClientNo", clientNo);
+            fields.put("Command", "CMD_DOLOGIN");
+            String loginType = "";
+            if("card".equalsIgnoreCase(task.getLoginType())) {
+                // 信用卡卡号登录
+                loginType =  "<LoginMode>1</LoginMode>" +
+                        "<CreditCardNo>"+task.getLoginName()+"</CreditCardNo>";
+            } else {
+                // 身份证登录
+                loginType =  "<LoginMode>0</LoginMode>" +
+                        "<IDTypeC>01</IDTypeC>" +
+                        "<IDNoC>"+task.getLoginName()+"</IDNoC>";
+            }
+            fields.put("XmlReq", "<PwdC>"+task.getPassWord()+"</PwdC>" +
+                    "<ExtraPwdC>"+imgValue+"</ExtraPwdC>" +
+                    "<LoginByCook>false</LoginByCook>" +
+                    loginType +
+                    "<RememberFlag>false</RememberFlag>" +
+                    "<UserAgent>Mozilla/F5.0+(Linux%3B+Android+5.1%3B+zh-cn%3B+HUAWEI+TAG-AL00+Build/FHUAWEITAG-AL00)+AppleWebKit/F537.36+(KHTML/C+like+Gecko)+Version/F4.0+Chrome/F39.0.0.0+Mobile+Safari/F537.36</UserAgent>" +
+                    "<screenW>360</screenW>" +
+                    "<screenH>640</screenH>" +
+                    "<OS>Linux+aarch64</OS>");
+            HttpResponse httpResponse = httpClientDownloader.request(httpPostRequest, false);
+            // 获取errorMsg
+            retCode = getErrorMsgByFirstLogin(httpResponse.getContent(), task);
+            if(RetCode.NEED_SMS == retCode) {
+                retCode = sendMessage(httpClientDownloader, task, extendMap);
+            }
+        } catch (Exception e) {
+            log.warn(">>>>>>>>>>招商信用卡H5渠道初次登录(account>>>>>>>>>>{}, phone>>>>>>>>>>{}, taskId>>>>>>>>>>{})异常>>>>>>>>>>{}",
+                    task.getLoginName(), task.getPhoneNum(), task.getTaskID(), e);
+            retCode = RetCode.FAILURE.setMsg("网络开小差，请稍后重试");
+            exception = e.getMessage();
+        } finally {
+            log.info(new LogBean().setAccount(task.getLoginName())
+                    .setUserId(task.getPhoneNum())
+                    .setToken(task.getToken())
+                    .setMethod("H5CMBCCCrawlerServiceImpl.firstLogin")
+                    .setStatus(retCode.code() + "")
+                    .setMessage(retCode.msg())
+                    .setProvince(task.getWebsite())
+                    .setSellId(SELLID)
+                    .setException(exception)
+                    .log2JsonStr());
+        }
+        return retCode;
+    }
+
+    /**
+     * 发送短信验证码
+     * @param httpClientDownloader
+     * @param task
+     * @param extendMap
+     * @return
+     */
+    private RetCode sendMessage(HttpClientDownloader httpClientDownloader, Task task, Map<String, Object> extendMap) {
+        RetCode retCode = RetCode.FAILURE;
+        String exception = null;
+        try {
+            HttpPostRequest httpPostRequest = new HttpPostRequest();
+            httpPostRequest.setUrl("https://html.m.cmbchina.com/MobileHtml/Login/MsgVerify.aspx");
+            httpPostRequest.setCharset("utf-8");
+            Map<String, Object> fields = new HashedMap();
+            fields.put("$RequestMode$", "1");
+            fields.put("MsgVerifyCmd", "Ajax_MSG_SEND");
+            fields.put("MsgFlag_", "010000");
+            fields.put("MsgCode", "");
+            fields.put("MsgTips_", "%E8%AF%B7%E9%80%89%E6%8B%A9%E4%B8%80%E4%B8%AA%E6%89%8B%E6%9C%BA%E5%8F%B7%E7%A0%81%EF%BC%8C%E5%B9%B6%E7%82%B9%E5%87%BB%E2%80%9C%E5%8F%91%E9%80%81%E7%9F%AD%E4%BF%A1%E9%AA%8C%E8%AF%81%E7%A0%81%E2%80%9D%E6%8C%89%E9%92%AE%E6%9D%A5%E5%8F%91%E9%80%81%E9%AA%8C%E8%AF%81%E7%A0%81%E3%80%82%E5%A6%82%E6%9E%9C%E4%BD%A0%E5%B7%B2%E7%BB%8F%E5%8F%96%E5%BE%97%E9%AA%8C%E8%AF%81%E7%A0%81%EF%BC%8C%E8%AF%B7%E7%9B%B4%E6%8E%A5%E5%9C%A8%E4%B8%8B%E9%9D%A2%E7%9A%84%E6%96%87%E6%9C%AC%E6%A1%86%E4%B8%AD%E8%BE%93%E5%85%A5%E5%8D%B3%E5%8F%AF%E3%80%82");
+            fields.put("ddlMobile", "1");
+            fields.put("ClientNo", String.valueOf(extendMap.get(CLIENTNOKEY)));
+            fields.put("Command", "");
+            httpPostRequest.setFields(fields);
+            HttpResponse httpResponse = httpClientDownloader.request(httpPostRequest, false);
+            if(httpResponse != null && StringUtils.isNotBlank(httpResponse.getContent())) {
+                JSONObject json = JSON.parseObject(httpResponse.getContent());
+                //{"$SysResult$":{"$SysCode$": 500,"$Content$": "{ErrCode:\"500\",DispMsg:\"短信验证码已发送至手机：158*****075，请在5分钟内完成验证。\"}"}}
+                String errCode = String.valueOf(JSONPath.eval(json, "$.$SysResult$.$SysCode$"));
+                if("500".equalsIgnoreCase(errCode)) {
+                    // 成功
+                    extendMap.put(COOKIEKEY, parseCookieStore(httpClientDownloader.getCookieStore()));
+                    redisService.saveCommParams(task.getTaskID(), extendMap);
+                    retCode = RetCode.NEED_SMS;
+                } else {
+                    // 失败
+                    log.warn(">>>>>>>>>>招商信用卡H5渠道发送短信(account>>>>>>>>>>{}, phone>>>>>>>>>>{}, taskId>>>>>>>>>>{})结果未知>>>>>>>>>>{}",
+                            task.getLoginName(), task.getPhoneNum(), task.getTaskID(), httpResponse.getContent());
+                    retCode = RetCode.FAILURE.setMsg("发送短信验证码失败，请稍候重试");
+                }
+            }
+        } catch (Exception e) {
+            log.warn(">>>>>>>>>>>>>>>>>>>>招商信用卡H5渠道发送短信(account>>>>>>>>>>{}, phone>>>>>>>>>>{}, taskId>>>>>>>>>>{})异常>>>>>>>>>>{}",
+                    task.getLoginName(), task.getPhoneNum(), task.getTaskID(), e);
+            retCode = RetCode.FAILURE.setMsg("发送短信验证码失败，请稍候重试");
+            exception = e.getMessage();
+        } finally {
+            log.info(new LogBean().setAccount(task.getLoginName())
+                    .setUserId(task.getPhoneNum())
+                    .setToken(task.getToken())
+                    .setMethod("H5CMBCCCrawlerServiceImpl.sendMessage")
+                    .setStatus(retCode.code() + "")
+                    .setMessage(retCode.msg())
+                    .setProvince(task.getWebsite())
+                    .setSellId(SELLID)
+                    .setException(exception)
+                    .log2JsonStr());
+        }
+        return retCode;
+    }
+
+    /**
+     * 二次登录请求，校验短信验证码
+     * @param httpClientDownloader
+     * @param task
+     * @param extendMap
+     * @return
+     */
+    private RetCode secondLogin(HttpClientDownloader httpClientDownloader, Task task, Map<String, Object> extendMap) {
+        RetCode retCode = RetCode.FAILURE;
+        String exception = null;
+        try {
+            HttpPostRequest httpPostRequest = new HttpPostRequest();
+            httpPostRequest.setUrl("https://html.m.cmbchina.com/MobileHtml/Login/MsgVerify.aspx");
+            httpPostRequest.setCharset("utf-8");
+
+            Map<String,String> headers = new HashedMap(4);
+            headers.put("Host", "html.m.cmbchina.com");
+            headers.put("x-wap-profile", "http://wap1.huawei.com/uaprof/HUAWEI_TANGO_UAProfile.xml");
+            headers.put("User-Agent", "Mozilla/5.0 (Linux; Android 5.1; zh-cn; HUAWEI TAG-AL00 Build/HUAWEITAG-AL00) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/39.0.0.0 Mobile Safari/537.36");
+            headers.put("Referer", "https://html.m.cmbchina.com/MobileHtml/Login/Logout.aspx");
+            headers.put("X-Requested-With", "com.android.browser");
+            httpPostRequest.setHeaders(headers);
+
+            Map<String, Object> fields = new HashedMap(7);
+            fields.put("MsgFlag_", "110000");
+            fields.put("MsgCode", task.getVerifyCode());
+            fields.put("MsgTips_", "%E8%AF%B7%E9%80%89%E6%8B%A9%E4%B8%80%E4%B8%AA%E6%89%8B%E6%9C%BA%E5%8F%B7%E7%A0%81%EF%BC%8C%E5%B9%B6%E7%82%B9%E5%87%BB%E2%80%9C%E5%8F%91%E9%80%81%E7%9F%AD%E4%BF%A1%E9%AA%8C%E8%AF%81%E7%A0%81%E2%80%9D%E6%8C%89%E9%92%AE%E6%9D%A5%E5%8F%91%E9%80%81%E9%AA%8C%E8%AF%81%E7%A0%81%E3%80%82%E5%A6%82%E6%9E%9C%E4%BD%A0%E5%B7%B2%E7%BB%8F%E5%8F%96%E5%BE%97%E9%AA%8C%E8%AF%81%E7%A0%81%EF%BC%8C%E8%AF%B7%E7%9B%B4%E6%8E%A5%E5%9C%A8%E4%B8%8B%E9%9D%A2%E7%9A%84%E6%96%87%E6%9C%AC%E6%A1%86%E4%B8%AD%E8%BE%93%E5%85%A5%E5%8D%B3%E5%8F%AF%E3%80%82");
+            fields.put("ddlMobile", "1");
+            fields.put("Command", "CMD_VERIFY");
+            fields.put("ClientNo", String.valueOf(extendMap.get(CLIENTNOKEY)));
+            fields.put("DeviceTAB", "TabDefault");
+            httpPostRequest.setFields(fields);
+
+            HttpResponse httpResponse = httpClientDownloader.request(httpPostRequest, false);
+            if(httpResponse != null && StringUtils.isNotBlank(httpResponse.getContent())) {
+                retCode = getErrorMsgBySecondLogin(httpResponse.getContent(), task);
+            } else {
+                retCode = RetCode.FAILURE.setMsg("网络开小差，请稍后重试");
+            }
+        } catch (Exception e) {
+            log.warn(">>>>>>>>>>招商信用卡H5渠道二次登录(account>>>>>>>>>>{}, phone>>>>>>>>>>{}, taskId>>>>>>>>>>{})异常>>>>>>>>>>{}",
+                    task.getLoginName(), task.getPhoneNum(), task.getTaskID(), e);
+            exception = e.getMessage();
+            retCode = RetCode.FAILURE.setMsg("网络开小差，请稍后重试");
+        } finally {
+            log.info(new LogBean().setAccount(task.getLoginName())
+                    .setUserId(task.getPhoneNum())
+                    .setToken(task.getToken())
+                    .setMethod("H5CMBCCCrawlerServiceImpl.secondLogin")
+                    .setStatus(retCode.code() + "")
+                    .setMessage(retCode.msg())
+                    .setProvince(task.getWebsite())
+                    .setSellId(SELLID)
+                    .setException(exception)
+                    .log2JsonStr());
+        }
+        return retCode;
+    }
+
+    /**
+     * 解析cookieStore,转换为String保存redis
+     * @param cookieStore
+     * @return
+     */
+    private String parseCookieStore(CookieStore cookieStore) {
+        String cookieString = null;
+        try {
+
+        } catch (Exception e) {
+
+        } finally {
+
+        }
+        return cookieString;
+    }
+
+    /**
+     * 根据cookieString生成cookie对象
+     * @param cookieString
+     * @return
+     */
+    private CookieStore generateCookieStore(String cookieString) {
+        CookieStore clientCookie = null;
+        try {
+
+        } catch (Exception e) {
+
+        } finally {
+
+        }
+        return clientCookie;
+    }
+
+    /**
+     * 获取errorMsg
+     * 无效附加码#2  图片验证码识别错误
+     * 您的查询密码输入错误，请重新输入
+     * 未查询到相关客户记录，如需帮助可致电400-820-5555转接服务专员为您服务
+     * 信用卡重设密码 需要重置密码
+     * @param response
+     */
+    public RetCode getErrorMsgByFirstLogin(String response, Task task) {
+        String tempResponse = null;
+        try {
+            if(StringUtils.isBlank(response)) {
+                return RetCode.FAILURE.setMsg("网络开小差，请稍后重试");
+            }
+            response = response.replaceAll("\\s*", "");
+            tempResponse = response;
+            if(response.contains("客户管理")) {
+                // 登录成功
+                return RetCode.SUCCESS;
+            } else if(response.contains("errMsg=")) {
+                response = response.substring(response.indexOf("errMsg=\"") + "errMsg=\"".length());
+                response = response.substring(0, response.indexOf("\""));
+                if(StringUtils.contains(response, "无效附加码")) {
+                    return RetCode.IMG_VALIDATE_ERROR;
+                } else if(StringUtils.contains(response, "查询密码输入错误")) {
+                    return RetCode.MISMATCH;
+                } else if(StringUtils.contains(response, "未查询到相关客户记录")) {
+                    return RetCode.FAILURE.setMsg("未查询到相关客户记录，如需帮助可致电400-820-5555转接服务专员为您服务");
+                } else {
+                    log.warn(">>>>>>>>>>招商信用卡H5渠道初次登录获取登录结果(account>>>>>>>>>>{}, phone>>>>>>>>>>{}, taskId>>>>>>>>>>{})未知>>>>>>>>>>{}",
+                            task.getLoginName(), task.getPhoneNum(), task.getTaskID(), response);
+                    return RetCode.FAILURE.setMsg(response);
+                }
+            } else {
+                //非登陆成功，查看页面title,判断流程
+                response = response.substring(response.indexOf("<title>") + "<title>".length(), response.indexOf("</title>"));
+                if(StringUtils.contains(response, "重设密码")) {
+                    // 需要重设密码
+                    return RetCode.MISMATCH.setMsg("密码简单，需要重新设置密码");
+                } else if(StringUtils.contains(response, "短信验证")) {
+                    // 需要短信验证码
+                    return RetCode.NEED_SMS;
+                } else {
+                    // 返回未知错误
+                    log.warn(">>>>>>>>>>招商信用卡H5渠道初次登录获取登录结果(account>>>>>>>>>>{}, phone>>>>>>>>>>{}, taskId>>>>>>>>>>{})未知>>>>>>>>>>{}",
+                            task.getLoginName(), task.getPhoneNum(), task.getTaskID(), response);
+                    return RetCode.FAILURE.setMsg("网络开小差，请稍后重试");
+                }
+            }
+        } catch (Exception e) {
+            log.warn(">>>>>>>>>>招商信用卡H5渠道初次登录获取登录结果(account>>>>>>>>>>{}, phone>>>>>>>>>>{}, taskId>>>>>>>>>>{}, response>>>>>>>>>>{})异常>>>>>>>>>>{}",
+                    task.getLoginName(), task.getPhoneNum(), task.getTaskID(), tempResponse);
+            return RetCode.FAILURE.setMsg("网络开小差，请稍后重试");
+        }
+    }
+
+
+    /**
+     *
+     * @param response
+     * @param task
+     * @return
+     */
+    private RetCode getErrorMsgBySecondLogin(String response, Task task) {
+        RetCode retCode = RetCode.FAILURE;
+        String tempResponse = null;
+        try {
+            tempResponse = response.replaceAll("\\s*", "");
+            if(tempResponse.contains("客户管理")) {
+                // 登录成功
+                return RetCode.SUCCESS;
+            } else {
+                Document document = Jsoup.parse(response);
+                String errorMsg = JSoupUtils.findTextByElement(document.getElementById("TitleMsg"));
+                if(StringUtils.isNotBlank(errorMsg) && errorMsg.contains("验证验证码失败")) {
+                    retCode = RetCode.NEED_SMS.setMsg(errorMsg);
+                } else {
+                    log.warn(">>>>>>>>>>招商信用卡H5渠道初次登录获取登录结果(account>>>>>>>>>>{}, phone>>>>>>>>>>{}, taskId>>>>>>>>>>{})未知>>>>>>>>>>{}",
+                            task.getLoginName(), task.getPhoneNum(), task.getTaskID(), tempResponse);
+                    retCode = RetCode.FAILURE.setMsg("网络开小差，请稍后重试");
+                }
+            }
+        } catch (Exception e) {
+            log.warn(">>>>>>>>>>招商信用卡H5渠道二次登录获取登录结果(account>>>>>>>>>>{}, phone>>>>>>>>>>{}, taskId>>>>>>>>>>{})异常>>>>>>>>>>{}",
+                    task.getLoginName(), task.getPhoneNum(), task.getTaskID(), e);
+            retCode = RetCode.FAILURE.setMsg("网络开小差，请稍后重试");
+        }
+        return retCode;
+    }
+
+
+}
